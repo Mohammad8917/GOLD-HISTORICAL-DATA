@@ -397,6 +397,7 @@ def clean_ticks(frame: pd.DataFrame, start: date, end: date) -> tuple[pd.DataFra
         "largest_unexpected": sorted(unexpected, key=lambda x: x["seconds"], reverse=True)[:10],
     }
 
+    expected_hours = scheduled_hours(lo, hi)
     daily = frame.set_index("time").resample("1D").size()
     expected_days = pd.date_range(lo.floor("D"), (hi - pd.Timedelta(nanoseconds=1)).floor("D"),
                                   freq="D", tz="UTC") if hi > lo else pd.DatetimeIndex([], tz="UTC")
@@ -419,7 +420,6 @@ def clean_ticks(frame: pd.DataFrame, start: date, end: date) -> tuple[pd.DataFra
     }
 
     hourly = frame.set_index("time").resample("1h").size()
-    expected_hours = scheduled_hours(lo, hi)
     active_hourly = hourly.reindex(expected_hours, fill_value=0)
     median_hour = float(active_hourly[active_hourly > 0].median()) if (active_hourly > 0).any() else 0.0
     low_hours = [
