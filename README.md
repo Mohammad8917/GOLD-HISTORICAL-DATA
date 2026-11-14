@@ -90,6 +90,8 @@ For the regular daily maintenance break, the expected closed UTC hour is general
 
 ### Holidays, early closes and exceptional closures — important limitation
 
+The repository includes a **review-only** dated notice list at `config/market_calendar_reviews.json`. An entry forces the affected batch to `review`; it does not mark any hour as closed or remove expected trading hours. This avoids treating a generic US public holiday as proof of a Dukascopy XAU/USD closure. For 2026-11-11 (US Veterans Day), the public Dukascopy notices reviewed for this change did not provide a date-specific XAU/USD schedule, so the date is flagged for manual review rather than assigning an invented closure interval.
+
 **The current pipeline does not yet ingest or apply a dated Dukascopy holiday/early-close calendar.** Its report explicitly marks `holiday_schedule_applied: false`. The regular weekly calendar is therefore not a complete holiday calendar.
 
 Dukascopy's published instrument-hours notice says XAU/USD has additional non-tradable hours on US national holidays: 17:00–21:00 during US summer time and 18:00–22:00 during US winter time. Dukascopy also publishes date-specific notices for holidays and special market breaks. These exceptions are not equivalent to simply marking the whole US public holiday as closed.
