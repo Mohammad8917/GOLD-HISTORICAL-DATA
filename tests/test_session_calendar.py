@@ -56,6 +56,24 @@ class SessionCalendarTests(unittest.TestCase):
         self.assertEqual(report["hourly_coverage"]["missing_trading_hours"], 0)
         self.assertEqual(report["hourly_coverage"]["low_hour_count"], 0)
 
+    def test_known_us_holiday_requires_provider_calendar_review(self):
+        entries = pipeline.calendar_review_entries(
+            pipeline.date(2026, 11, 11), pipeline.date(2026, 11, 12)
+        )
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["date"], "2026-11-11")
+
+        frame = pd.DataFrame({
+            "time": [self.ts("2026-11-11 12:00")],
+            "bid": [2000.0],
+            "ask": [2000.5],
+        })
+        _, report = pipeline.clean_ticks(
+            frame, pipeline.date(2026, 11, 11), pipeline.date(2026, 11, 12)
+        )
+        reasons = pipeline.evaluate(report)
+        self.assertTrue(any("Provider holiday/special-hours review required" in x for x in reasons))
+
     def test_dst_transition_uses_new_york_zone(self):
         # US DST starts 2026-03-08: Sunday 18:00 New York is 22:00 UTC.
         self.assertFalse(pipeline.is_scheduled_trading_hour(self.ts("2026-03-08 21:00")))
