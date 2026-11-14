@@ -296,8 +296,11 @@ def clean_ticks(frame: pd.DataFrame, start: date, end: date) -> tuple[pd.DataFra
     report["was_sorted"] = bool(frame["time"].is_monotonic_increasing)
     frame = frame.sort_values("time", kind="stable").reset_index(drop=True)
     lo, hi = pd.Timestamp(start, tz="UTC"), pd.Timestamp(end, tz="UTC")
-    inside = frame["time"].notna() & (frame["time"] >= lo) & (frame["time"] < hi)
-    report["outside_window"] = int((~inside).sum())
+    invalid_timestamp = frame["time"].isna()
+    report["invalid_timestamp"] = int(invalid_timestamp.sum())
+    valid_time = ~invalid_timestamp
+    inside = valid_time & (frame["time"] >= lo) & (frame["time"] < hi)
+    report["outside_window"] = int((valid_time & ~inside).sum())
     frame = frame.loc[inside].copy()
 
     duplicate = frame.duplicated(keep="first")
@@ -309,7 +312,8 @@ def clean_ticks(frame: pd.DataFrame, start: date, end: date) -> tuple[pd.DataFra
         & frame["ask"].map(lambda x: math.isfinite(float(x)) if pd.notna(x) else False)
     )
     invalid = ~finite | (frame["bid"] <= 0) | (frame["ask"] <= 0)
-    report["invalid"] = int(invalid.sum())
+    report["invalid_price"] = int(invalid.sum())
+    report["invalid"] = report["invalid_timestamp"] + report["invalid_price"]
     frame = frame.loc[~invalid].sort_values("time", kind="stable").reset_index(drop=True)
     report["rows_clean"] = int(len(frame))
     if frame.empty:
@@ -660,7 +664,18 @@ def verify_archive(label: str) -> bool:
         print(f"[{label}] Archive manifest missing.")
         return False
     manifest = read_json(manifest_path)
-    for relative, info in manifest.get("files", {}).items():
+    expected = {"ticks.parquet"} | {f"candles/{name}.parquet" for name in TIMEFRAMES}
+    files = manifest.get("files")
+    if not isinstance(files, dict) or set(files) != expected:
+        print(f"[{label}] Archive manifest file list is incomplete or unexpected.")
+        return False
+    if manifest.get("label") != label or manifest.get("instrument") != INSTRUMENT:
+        print(f"[{label}] Archive manifest identity mismatch.")
+        return False
+    if manifest.get("quality_status") not in ("pass", "review"):
+        print(f"[{label}] Archive manifest has an invalid quality status.")
+        return False
+    for relative, info in files.items():
         path = directory / relative
         if not path.is_file():
             print(f"[{label}] Missing archive file: {relative}")
