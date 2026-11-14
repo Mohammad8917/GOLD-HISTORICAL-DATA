@@ -66,7 +66,7 @@ The pipeline currently checks invalid prices, duplicate rows, conflicting timest
 
 A `pass` means only that this script's current structural screening thresholds passed. It does **not** prove that the feed is identical to another broker's XAU/USD prices, that all market sessions are covered, or that the data is suitable for live trading. Dukascopy is a specific OTC feed; XAU/USD is not one centralized exchange-traded market.
 
-Suspicious ticks are reported rather than silently repaired. Weekend/session classification is approximate and the screening thresholds still require calibration against real downloaded samples. Higher-timeframe candles are built from the downloaded tick feed, not independently sourced provider-native bars.
+Suspicious ticks are reported rather than silently repaired. Regular XAU/USD session coverage is modeled in `America/New_York` time (18:00-17:00 Sunday-Friday), so the daily 17:00-18:00 maintenance break and US daylight-saving transitions are converted to UTC with the IANA timezone database. The calendar does not infer exceptional holiday hours, early closes, or provider outages; those dates require separate review. A missing scheduled trading hour is flagged, while a fully closed interval is not treated as a data gap. Gap classification must not hide a missing open-session hour across a market break. Wide spreads remain in the raw/cleaned feed and are reported rather than silently removed. Higher-timeframe candles are built from the downloaded tick feed, not independently sourced provider-native bars.
 
 Keep raw provider files unchanged. Do not silently fill missing intervals or remove suspicious observations.
 
