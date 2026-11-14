@@ -1,9 +1,3 @@
 {
-  "review_dates": [
-    {
-      "date": "2026-11-11",
-      "reason": "US Veterans Day; no date-specific XAU/USD hours confirmed in the reviewed Dukascopy public notices. Verify the provider's exact schedule before approval.",
-      "source": "https://www.dukascopy.com/swiss/english/about/ournews/"
-    }
-  ]
+  "review_dates": []
 }
