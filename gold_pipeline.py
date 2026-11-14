@@ -310,8 +310,11 @@ def weekend_gap(previous: pd.Timestamp, current: pd.Timestamp) -> bool:
     # Retained for gap classification, now based on the same DST-aware session calendar.
     if current <= previous:
         return False
-    gap_hours = pd.date_range(previous.floor("h"), current.floor("h"), freq="h", tz="UTC")
-    return any(not is_scheduled_trading_hour(hour) for hour in gap_hours)
+    first_interior_hour = previous.floor("h") + pd.Timedelta(hours=1)
+    gap_hours = pd.date_range(first_interior_hour, current.floor("h"), freq="h", inclusive="left", tz="UTC")
+    # A gap is scheduled only when every fully missing hourly bin was closed.
+    # Never let one maintenance/weekend hour hide a missing open-session hour.
+    return bool(len(gap_hours)) and all(not is_scheduled_trading_hour(hour) for hour in gap_hours)
 
 
 def clean_ticks(frame: pd.DataFrame, start: date, end: date) -> tuple[pd.DataFrame, dict]:
