@@ -29,9 +29,10 @@ import math
 import shutil
 import subprocess
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -47,6 +48,9 @@ TICKS = STAGING / "ticks"
 CANDLES = STAGING / "candles"
 REPORTS = STAGING / "reports"
 
+# Dated notices requiring manual provider-calendar review; never assumed closures.
+CALENDAR_REVIEW_FILE = Path("config/market_calendar_reviews.json")
+
 # Screening thresholds; calibrate against real feed history before large runs.
 MAX_INVALID_FRAC = 0.001
 MAX_CONFLICT_TS_FRAC = 0.001
@@ -55,8 +59,12 @@ GAP_INFO_MIN = 10
 UNEXPECTED_GAP_MIN = 120
 LOW_DAY_FRAC = 0.20
 LOW_HOUR_FRAC = 0.20
-FRIDAY_CLOSE_UTC_HOUR = 20
-SUNDAY_OPEN_UTC_HOUR = 23
+# Dukascopy XAU/USD regular session: 18:00-17:00 America/New_York,
+# Sunday through Friday. The daily 17:00-18:00 NY break and DST changes
+# are converted to UTC by zoneinfo. Exceptional holidays are not inferred.
+MARKET_TZ = ZoneInfo("America/New_York")
+SESSION_OPEN_LOCAL = clock_time(18, 0)
+SESSION_CLOSE_LOCAL = clock_time(17, 0)
 
 OHLC_COLUMNS = [
     f"{side}_{field}"
@@ -272,16 +280,75 @@ def load_ticks(directory: Path) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def calendar_review_entries(start: date, end: date) -> list[dict[str, str]]:
+    """Return review notices overlapping [start, end); entries do not imply closures."""
+    if not CALENDAR_REVIEW_FILE.is_file():
+        return []
+    payload = read_json(CALENDAR_REVIEW_FILE)
+    entries = payload.get("review_dates")
+    if not isinstance(entries, list):
+        die(f"Invalid review_dates list in {CALENDAR_REVIEW_FILE}")
+    selected = []
+    for item in entries:
+        if not isinstance(item, dict):
+            die(f"Invalid calendar review entry in {CALENDAR_REVIEW_FILE}")
+        try:
+            review_day = parse_day(item["date"])
+            reason = str(item["reason"]).strip()
+            source = str(item["source"]).strip()
+        except (KeyError, TypeError, ValueError):
+            die(f"Calendar review entry requires date, reason and source: {item}")
+        if not reason or not source:
+            die(f"Calendar review entry has empty reason/source: {item}")
+        if start <= review_day < end:
+            selected.append({"date": review_day.isoformat(), "reason": reason, "source": source})
+    return selected
+
+def is_scheduled_trading_hour(hour_start_utc: pd.Timestamp) -> bool:
+    """Whether the UTC hour beginning at hour_start_utc is in the regular XAU/USD session.
+
+    This models Dukascopy's regular 18:00-17:00 America/New_York session,
+    Sunday-Friday, including the daily maintenance break and US DST.
+    It does not model exceptional holiday/early-close schedules.
+    """
+    local = hour_start_utc.tz_convert(MARKET_TZ)
+    weekday = local.weekday()  # Monday=0, Sunday=6
+    local_time = local.time()
+    if weekday == 5:  # Saturday
+        return False
+    if weekday == 6:  # Sunday: opens at 18:00 local
+        return local_time >= SESSION_OPEN_LOCAL
+    if weekday == 4:  # Friday: closes at 17:00 local
+        return local_time < SESSION_CLOSE_LOCAL
+    # Monday-Thursday: 17:00-18:00 local maintenance break
+    return local_time < SESSION_CLOSE_LOCAL or local_time >= SESSION_OPEN_LOCAL
+
+
+def scheduled_hours(start_utc: pd.Timestamp, end_utc: pd.Timestamp) -> pd.DatetimeIndex:
+    """UTC hourly bin starts in [start_utc, end_utc) scheduled for trading."""
+    if end_utc <= start_utc:
+        return pd.DatetimeIndex([], tz="UTC")
+    bins = pd.date_range(start_utc.floor("h"), (end_utc - pd.Timedelta(nanoseconds=1)).floor("h"),
+                         freq="h", tz="UTC")
+    return pd.DatetimeIndex([hour for hour in bins if is_scheduled_trading_hour(hour)])
+
+
 def weekend_gap(previous: pd.Timestamp, current: pd.Timestamp) -> bool:
-    # Approximation only; verify against the provider's actual trading calendar.
-    friday_evening = previous.weekday() == 4 and previous.hour >= FRIDAY_CLOSE_UTC_HOUR
-    saturday_or_sunday = current.weekday() in (5, 6)
-    sunday_open = current.weekday() == 6 and current.hour <= SUNDAY_OPEN_UTC_HOUR
-    return bool(friday_evening or saturday_or_sunday or sunday_open)
+    # Retained for gap classification, now based on the same DST-aware session calendar.
+    if current <= previous:
+        return False
+    first_interior_hour = previous.floor("h") + pd.Timedelta(hours=1)
+    gap_hours = pd.date_range(first_interior_hour, current.floor("h"), freq="h", inclusive="left", tz="UTC")
+    # A gap is scheduled only when every fully missing hourly bin was closed.
+    # Never let one maintenance/weekend hour hide a missing open-session hour.
+    return bool(len(gap_hours)) and all(not is_scheduled_trading_hour(hour) for hour in gap_hours)
 
 
 def clean_ticks(frame: pd.DataFrame, start: date, end: date) -> tuple[pd.DataFrame, dict]:
+    review_entries = calendar_review_entries(start, end)
     report: dict[str, Any] = {
+        "holiday_schedule_applied": False,
+        "holiday_calendar_review": review_entries,
         "rows_raw": int(len(frame)),
         "outside_window": 0,
         "duplicates": 0,
@@ -360,36 +427,47 @@ def clean_ticks(frame: pd.DataFrame, start: date, end: date) -> tuple[pd.DataFra
         "largest_unexpected": sorted(unexpected, key=lambda x: x["seconds"], reverse=True)[:10],
     }
 
+    expected_hours = scheduled_hours(lo, hi)
     daily = frame.set_index("time").resample("1D").size()
-    expected_days = pd.date_range(lo, hi, inclusive="left", freq="D", tz="UTC")
-    weekdays = [day for day in expected_days if day.weekday() < 5]
-    weekday_counts = daily[daily.index.weekday < 5]
-    median_day = float(weekday_counts.median()) if len(weekday_counts) else 0.0
-    missing_days = [day.isoformat() for day in weekdays if daily.get(day, 0) == 0]
+    expected_days = pd.date_range(lo.floor("D"), (hi - pd.Timedelta(nanoseconds=1)).floor("D"),
+                                  freq="D", tz="UTC") if hi > lo else pd.DatetimeIndex([], tz="UTC")
+    expected_day_hours = {day: sum(1 for hour in expected_hours if hour.floor("D") == day)
+                          for day in expected_days}
+    active_days = [day for day, count in expected_day_hours.items() if count > 0]
+    active_day_counts = pd.Series({day: int(daily.get(day, 0)) for day in active_days}, dtype="int64")
+    median_day = float(active_day_counts[active_day_counts > 0].median()) if (active_day_counts > 0).any() else 0.0
+    missing_days = [day.isoformat() for day in active_days if daily.get(day, 0) == 0]
     low_days = [
-        day.isoformat() for day, count in weekday_counts.items()
+        day.isoformat() for day, count in active_day_counts.items()
         if median_day > 0 and count < LOW_DAY_FRAC * median_day
     ]
     report["daily_coverage"] = {
-        "weekdays_expected": len(weekdays),
-        "weekdays_with_ticks": len(weekdays) - len(missing_days),
-        "missing_weekdays": missing_days,
-        "median_ticks_per_weekday": median_day,
+        "trading_days_expected": len(active_days),
+        "trading_days_with_ticks": len(active_days) - len(missing_days),
+        "missing_trading_days": missing_days,
+        "median_ticks_per_trading_day": median_day,
         "low_days": low_days,
     }
 
     hourly = frame.set_index("time").resample("1h").size()
-    weekday_hours = hourly[hourly.index.weekday < 5]
-    median_hour = float(weekday_hours.median()) if len(weekday_hours) else 0.0
+    active_hourly = hourly.reindex(expected_hours, fill_value=0)
+    median_hour = float(active_hourly[active_hourly > 0].median()) if (active_hourly > 0).any() else 0.0
     low_hours = [
         {"hour_utc": hour.isoformat(), "ticks": int(count)}
-        for hour, count in weekday_hours.items()
+        for hour, count in active_hourly.items()
         if median_hour > 0 and count < LOW_HOUR_FRAC * median_hour
     ]
     report["hourly_coverage"] = {
-        "median_ticks_per_weekday_hour": median_hour,
+        "calendar": "Dukascopy XAU/USD regular session, America/New_York 18:00-17:00 Sun-Fri",
+        "timezone": "America/New_York (DST-aware)",
+        "expected_trading_hours": int(len(expected_hours)),
+        "observed_trading_hours": int((active_hourly > 0).sum()),
+        "missing_trading_hours": int((active_hourly == 0).sum()),
+        "median_ticks_per_trading_hour": median_hour,
         "low_hour_count": len(low_hours),
         "low_hour_examples": low_hours[:40],
+        "holiday_schedule_applied": False,
+        "holiday_calendar_review": review_entries,
     }
 
     spread = frame["ask"] - frame["bid"]
@@ -397,6 +475,7 @@ def clean_ticks(frame: pd.DataFrame, start: date, end: date) -> tuple[pd.DataFra
         "median": float(spread.median()),
         "p99": float(spread.quantile(0.99)),
         "max": float(spread.max()),
+        "note": "Wide spreads are reported, not deleted or automatically treated as invalid quotes.",
     }
     return frame, report
 
@@ -447,7 +526,9 @@ def rollup_mismatches(m1: pd.DataFrame, direct: pd.DataFrame, rule: str) -> int:
 def evaluate(report: dict) -> list[str]:
     reasons = []
     if report.get("rows_clean", 0) <= 0:
-        return ["No valid ticks after cleaning."]
+        reasons.append("No valid ticks after cleaning.")
+    for entry in report.get("holiday_calendar_review", []):
+        reasons.append("Provider holiday/special-hours review required for " + entry["date"] + ": " + entry["reason"] + " Source: " + entry["source"])
     invalid_fraction = report.get("invalid", 0) / max(report.get("rows_raw", 0), 1)
     if invalid_fraction > MAX_INVALID_FRAC:
         reasons.append("Invalid-row fraction exceeds threshold.")
@@ -460,12 +541,14 @@ def evaluate(report: dict) -> list[str]:
     if report.get("gaps", {}).get("unexpected_count", 0):
         reasons.append("Unexpected gaps detected outside approximate weekend closure.")
     coverage = report.get("daily_coverage", {})
-    if coverage.get("missing_weekdays"):
-        reasons.append("Weekdays with no ticks detected.")
+    if coverage.get("missing_trading_days"):
+        reasons.append("Scheduled trading days with no ticks detected.")
     if coverage.get("low_days"):
         reasons.append("Weekdays with unusually low tick counts.")
+    if report.get("hourly_coverage", {}).get("missing_trading_hours", 0):
+        reasons.append("Scheduled trading hours with no ticks detected.")
     if report.get("hourly_coverage", {}).get("low_hour_count", 0):
-        reasons.append("Hours with unusually low tick counts.")
+        reasons.append("Scheduled trading hours with unusually low tick counts.")
     if any(report.get("m1_rollup_mismatches", {}).values()):
         reasons.append("M1 roll-up does not match direct higher-timeframe candles.")
     return reasons
