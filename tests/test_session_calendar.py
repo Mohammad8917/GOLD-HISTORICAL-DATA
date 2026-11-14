@@ -37,6 +37,25 @@ class SessionCalendarTests(unittest.TestCase):
             self.ts("2026-11-12 21:59"), self.ts("2026-11-13 00:01")
         ))
 
+    def test_clean_ticks_uses_scheduled_hours_before_daily_coverage(self):
+        start = pipeline.date(2026, 11, 12)
+        end = pipeline.date(2026, 11, 13)
+        hours = pipeline.scheduled_hours(
+            pd.Timestamp(start, tz="UTC"), pd.Timestamp(end, tz="UTC")
+        )
+        frame = pd.DataFrame({
+            "time": hours + pd.Timedelta(minutes=30),
+            "bid": [2000.0] * len(hours),
+            "ask": [2000.5] * len(hours),
+        })
+
+        cleaned, report = pipeline.clean_ticks(frame, start, end)
+
+        self.assertEqual(len(cleaned), 23)
+        self.assertEqual(report["hourly_coverage"]["expected_trading_hours"], 23)
+        self.assertEqual(report["hourly_coverage"]["missing_trading_hours"], 0)
+        self.assertEqual(report["hourly_coverage"]["low_hour_count"], 0)
+
     def test_dst_transition_uses_new_york_zone(self):
         # US DST starts 2026-03-08: Sunday 18:00 New York is 22:00 UTC.
         self.assertFalse(pipeline.is_scheduled_trading_hour(self.ts("2026-03-08 21:00")))
