@@ -48,6 +48,9 @@ TICKS = STAGING / "ticks"
 CANDLES = STAGING / "candles"
 REPORTS = STAGING / "reports"
 
+# Dated notices requiring manual provider-calendar review; never assumed closures.
+CALENDAR_REVIEW_FILE = Path("config/market_calendar_reviews.json")
+
 # Screening thresholds; calibrate against real feed history before large runs.
 MAX_INVALID_FRAC = 0.001
 MAX_CONFLICT_TS_FRAC = 0.001
@@ -277,6 +280,30 @@ def load_ticks(directory: Path) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def calendar_review_entries(start: date, end: date) -> list[dict[str, str]]:
+    """Return review notices overlapping [start, end); entries do not imply closures."""
+    if not CALENDAR_REVIEW_FILE.is_file():
+        return []
+    payload = read_json(CALENDAR_REVIEW_FILE)
+    entries = payload.get("review_dates")
+    if not isinstance(entries, list):
+        die(f"Invalid review_dates list in {CALENDAR_REVIEW_FILE}")
+    selected = []
+    for item in entries:
+        if not isinstance(item, dict):
+            die(f"Invalid calendar review entry in {CALENDAR_REVIEW_FILE}")
+        try:
+            review_day = parse_day(item["date"])
+            reason = str(item["reason"]).strip()
+            source = str(item["source"]).strip()
+        except (KeyError, TypeError, ValueError):
+            die(f"Calendar review entry requires date, reason and source: {item}")
+        if not reason or not source:
+            die(f"Calendar review entry has empty reason/source: {item}")
+        if start <= review_day < end:
+            selected.append({"date": review_day.isoformat(), "reason": reason, "source": source})
+    return selected
+
 def is_scheduled_trading_hour(hour_start_utc: pd.Timestamp) -> bool:
     """Whether the UTC hour beginning at hour_start_utc is in the regular XAU/USD session.
 
@@ -318,7 +345,10 @@ def weekend_gap(previous: pd.Timestamp, current: pd.Timestamp) -> bool:
 
 
 def clean_ticks(frame: pd.DataFrame, start: date, end: date) -> tuple[pd.DataFrame, dict]:
+    review_entries = calendar_review_entries(start, end)
     report: dict[str, Any] = {
+        "holiday_schedule_applied": False,
+        "holiday_calendar_review": review_entries,
         "rows_raw": int(len(frame)),
         "outside_window": 0,
         "duplicates": 0,
@@ -437,6 +467,7 @@ def clean_ticks(frame: pd.DataFrame, start: date, end: date) -> tuple[pd.DataFra
         "low_hour_count": len(low_hours),
         "low_hour_examples": low_hours[:40],
         "holiday_schedule_applied": False,
+        "holiday_calendar_review": review_entries,
     }
 
     spread = frame["ask"] - frame["bid"]
@@ -495,7 +526,9 @@ def rollup_mismatches(m1: pd.DataFrame, direct: pd.DataFrame, rule: str) -> int:
 def evaluate(report: dict) -> list[str]:
     reasons = []
     if report.get("rows_clean", 0) <= 0:
-        return ["No valid ticks after cleaning."]
+        reasons.append("No valid ticks after cleaning.")
+    for entry in report.get("holiday_calendar_review", []):
+        reasons.append("Provider holiday/special-hours review required for " + entry["date"] + ": " + entry["reason"] + " Source: " + entry["source"])
     invalid_fraction = report.get("invalid", 0) / max(report.get("rows_raw", 0), 1)
     if invalid_fraction > MAX_INVALID_FRAC:
         reasons.append("Invalid-row fraction exceeds threshold.")
